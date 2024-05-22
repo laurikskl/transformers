@@ -30,7 +30,7 @@ from ...modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     CausalLMOutputWithCrossAttentions,
     CausalLMOutputWithPast,
-    QuestionAnsweringModelOutput,
+    QuestionAnswer00ingModelOutput,
     SequenceClassifierOutputWithPast,
     TokenClassifierOutput,
 )
@@ -40,13 +40,11 @@ from ...utils import (
     add_code_sample_docstrings,
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
-    is_flash_attn_2_available,
-    is_flash_attn_greater_or_equal_2_10,
     is_torch_fx_available,
     logging,
 )
 from .configuration_gpt_neo import GPTNeoConfig
-
+from infiniattention import InfiniAttention
 
 
 # This makes `_prepare_4d_causal_attention_mask` a leaf function in the FX graph.
@@ -79,139 +77,6 @@ def _get_unpad_data(attention_mask):
     )
 
 
-
-class GPTNeoSelfAttention(nn.Module):
-    def __init__(self, config, attention_type):
-        super().__init__()
-        self.config = config
-
-        max_positions = config.max_position_embeddings
-        bias = torch.tril(torch.ones((max_positions, max_positions), dtype=bool)).view(
-            1, 1, max_positions, max_positions
-        )
-
-        # local causal self attention is a sliding window where each token can only attend to the previous
-        # window_size tokens. This is implemented by updating the causal mask such that for each token
-        # all other tokens are masked except the previous window_size tokens.
-        if attention_type == "local":
-            bias = torch.bitwise_xor(bias, torch.tril(bias, -config.window_size))
-
-        self.register_buffer("bias", bias, persistent=False)
-        self.register_buffer("masked_bias", torch.tensor(-1e9), persistent=False)
-
-        self.attn_dropout = nn.Dropout(float(config.attention_dropout))
-        self.resid_dropout = nn.Dropout(float(config.resid_dropout))
-        self.is_causal = True
-
-        self.embed_dim = config.hidden_size
-        self.num_heads = config.num_heads
-        self.head_dim = self.embed_dim // self.num_heads
-        if self.head_dim * self.num_heads != self.embed_dim:
-            raise ValueError(
-                f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`:"
-                f" {self.num_heads})."
-            )
-
-        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
-
-    def _split_heads(self, tensor, num_heads, attn_head_size):
-        """
-        Splits hidden_size dim into attn_head_size and num_heads
-        """
-        new_shape = tensor.size()[:-1] + (num_heads, attn_head_size)
-        tensor = tensor.view(new_shape)
-        return tensor.permute(0, 2, 1, 3)  # (batch, head, seq_length, head_features)
-
-    def _merge_heads(self, tensor, num_heads, attn_head_size):
-        """
-        Merges attn_head_size dim and num_attn_heads dim into hidden_size
-        """
-        tensor = tensor.permute(0, 2, 1, 3).contiguous()
-        new_shape = tensor.size()[:-2] + (num_heads * attn_head_size,)
-        return tensor.view(new_shape)
-
-    def _attn(self, query, key, value, attention_mask=None, head_mask=None):
-        # Keep the attention weights computation in fp32 to avoid overflow issues
-        query = query.to(torch.float32)
-        key = key.to(torch.float32)
-
-        attn_weights = torch.matmul(query, key.transpose(-1, -2))
-
-        query_length, key_length = query.size(-2), key.size(-2)
-        causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
-        mask_value = torch.finfo(attn_weights.dtype).min
-        # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
-        # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
-        mask_value = torch.tensor(mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
-        attn_weights = torch.where(causal_mask, attn_weights, mask_value)
-
-        if attention_mask is not None:
-            # Apply the attention mask
-            attn_weights = attn_weights + attention_mask
-
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-        attn_weights = attn_weights.to(value.dtype)
-        attn_weights = self.attn_dropout(attn_weights)
-
-        # Mask heads if we want to
-        if head_mask is not None:
-            attn_weights = attn_weights * head_mask
-
-        attn_output = torch.matmul(attn_weights, value)
-
-        return attn_output, attn_weights
-
-    def forward(
-        self,
-        hidden_states,
-        attention_mask=None,
-        layer_past=None,
-        head_mask=None,
-        use_cache=False,
-        output_attentions=False,
-    ):
-        query = self.q_proj(hidden_states)
-        key = self.k_proj(hidden_states)
-        value = self.v_proj(hidden_states)
-
-        query = self._split_heads(query, self.num_heads, self.head_dim)
-        key = self._split_heads(key, self.num_heads, self.head_dim)
-        value = self._split_heads(value, self.num_heads, self.head_dim)
-
-        if layer_past is not None:
-            past_key = layer_past[0]
-            past_value = layer_past[1]
-            key = torch.cat((past_key, key), dim=-2)
-            value = torch.cat((past_value, value), dim=-2)
-
-        if use_cache is True:
-            present = (key, value)
-        else:
-            present = None
-
-        attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
-
-        attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
-        attn_output = self.out_proj(attn_output)
-        attn_output = self.resid_dropout(attn_output)
-
-        outputs = (attn_output, present)
-        if output_attentions:
-            outputs += (attn_weights,)
-
-        return outputs  # a, present, (attentions)
-
-
-
-
-GPT_NEO_ATTENTION_CLASSES = {
-    "eager": GPTNeoSelfAttention,
-}
-
-
 class GPTNeoAttention(nn.Module):
     def __init__(self, config, layer_id=0):
         super().__init__()
@@ -220,7 +85,7 @@ class GPTNeoAttention(nn.Module):
         self.attention_type = self.attention_layers[layer_id]
 
         if self.attention_type in ["global", "local"]:
-            self.attention = GPT_NEO_ATTENTION_CLASSES[config._attn_implementation](config, self.attention_type)
+            self.attention = InfiniAttention(config, self.attention_type)
         else:
             raise NotImplementedError(
                 "Only attn layer types 'global' and 'local' exist, but got `config.attention_layers`: "
@@ -232,6 +97,7 @@ class GPTNeoAttention(nn.Module):
         hidden_states,
         layer_past=None,
         attention_mask=None,
+        position_ids=None,
         head_mask=None,
         use_cache=False,
         output_attentions=False,
@@ -240,6 +106,7 @@ class GPTNeoAttention(nn.Module):
             hidden_states,
             attention_mask=attention_mask,
             layer_past=layer_past,
+            position_ids=position_ids,
             head_mask=head_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
@@ -278,6 +145,7 @@ class GPTNeoBlock(nn.Module):
         hidden_states,
         layer_past=None,
         attention_mask=None,
+        position_ids= None,
         head_mask=None,
         use_cache=False,
         output_attentions=False,
@@ -288,6 +156,7 @@ class GPTNeoBlock(nn.Module):
             hidden_states,
             layer_past=layer_past,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             head_mask=head_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
@@ -435,7 +304,7 @@ class GPTNeoModel(GPTNeoPreTrainedModel):
 
         self.embed_dim = config.hidden_size
         self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
-        self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
+        # self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
         self.drop = nn.Dropout(float(config.embed_dropout))
         self.h = nn.ModuleList([GPTNeoBlock(config, layer_id=i) for i in range(config.num_layers)])
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
@@ -512,8 +381,8 @@ class GPTNeoModel(GPTNeoPreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
-        position_embeds = self.wpe(position_ids)
-        hidden_states = inputs_embeds + position_embeds
+        # position_embeds = self.wpe(position_ids)
+        hidden_states = inputs_embeds
 
         # Attention mask.
         if self._use_flash_attention_2:
@@ -551,6 +420,7 @@ class GPTNeoModel(GPTNeoPreTrainedModel):
                     hidden_states,
                     None,
                     attention_mask,
+                    position_ids,
                     head_mask[i],
                     use_cache,
                     output_attentions,
@@ -560,6 +430,7 @@ class GPTNeoModel(GPTNeoPreTrainedModel):
                     hidden_states,
                     layer_past=layer_past,
                     attention_mask=attention_mask,
+                    position_ids=position_ids,
                     head_mask=head_mask[i],
                     use_cache=use_cache,
                     output_attentions=output_attentions,

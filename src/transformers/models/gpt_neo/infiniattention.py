@@ -1,6 +1,6 @@
 import os
 from typing import Optional, Tuple, Union
-from rope import apply_rotary_pos_emb, rotate_half, GPTNeoXRotaryEmbedding
+from rope import apply_rotary_pos_emb, GPTNeoXRotaryEmbedding
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -41,7 +41,7 @@ class InfiniAttention(nn.Module):
         # The 1.0 is pct of the head_dim to use for rotary embedding
         self.rotary_ndims = int(self.head_dim * 1.0)
 
-        self.rotary_emb = GPTNeoXRotaryEmbedding(self.rotary_ndims, self.config.max_position_embeddings, base=self.config.rotary_emb_base)
+        self.rotary_emb = GPTNeoXRotaryEmbedding(self.rotary_ndims, max_positions, base=10000)
 
         self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
         self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
@@ -134,6 +134,7 @@ class InfiniAttention(nn.Module):
     def forward(
         self,
         hidden_states,
+        position_ids,
         attention_mask=None,
         layer_past=None,
         head_mask=None,
